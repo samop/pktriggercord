@@ -1,0 +1,190 @@
+Index: pslr.c
+===================================================================
+--- pslr.c	(revision 270)
++++ pslr.c	(working copy)
+@@ -175,6 +175,128 @@
+     X10_DUST
+ } x10_subcommands_t;
+ 
++/* ************** Enabling/disabling debug mode *************/
++/* Done by reverse engineering the USB communication between PK Tether and */
++/* Pentax K-10D camera. The debug on/off should work without breaking the  */
++/* camera, but you are invoking this subroutines without any warranties    */
++/* Written by: Samo Penic, 2014 */
++
++#define DEBUG_OFF 0
++#define DEBUG_ON 1
++
++/* a different write_args function needs to be done with slightly changed */
++/* command sequence. Original function was ipslr_write_args(). */
++static int ipslr_write_args_special(ipslr_handle_t *p, int n, ...) {
++    va_list ap;
++    uint8_t cmd[8] = {0xf0, 0x4f, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00};
++    uint8_t buf[4 * n];
++    int fd = p->fd;
++    int res;
++    int i;
++    uint32_t data;
++
++    va_start(ap, n);
++    if( p->model && !p->model->old_scsi_command ) {
++        /* All at once */
++        for (i = 0; i < n; i++) {
++            data = va_arg(ap, uint32_t);
++            buf[4 * i + 0] = data >> 24;
++            buf[4 * i + 1] = data >> 16;
++            buf[4 * i + 2] = data >> 8;
++            buf[4 * i + 3] = data;
++        }
++        cmd[4] = 4 * n;
++        res = scsi_write(fd, cmd, sizeof (cmd), buf, 4 * n);
++      	if (res != PSLR_OK) {
++            return res;
++    }
++    } else {
++        /* Arguments one by one */
++        for (i = 0; i < n; i++) {
++            data = va_arg(ap, uint32_t);
++            buf[0] = data >> 24;
++            buf[1] = data >> 16;
++            buf[2] = data >> 8;
++            buf[3] = data;
++            cmd[4] = 4;
++            cmd[2] = i * 4;
++            res = scsi_write(fd, cmd, sizeof (cmd), buf, 4);
++            if (res != PSLR_OK) {
++                return res;
++        }
++        }
++    }
++    va_end(ap);
++    return PSLR_OK;
++}
++
++/* Commands in form 23 XX YY. I know it si stupid, but ipslr_cmd functions  */
++/* are sooooo handy.                                                        */
++static int ipslr_cmd_23_XX(ipslr_handle_t *p, char XX, char YY, uint32_t mode) {
++    CHECK(ipslr_write_args(p, 1, mode));
++    CHECK(command(p->fd, 0x23, XX, YY));
++    CHECK(get_status(p->fd));
++    return PSLR_OK;
++}
++
++/* First of two exceptions. Command 0x23 0x06 0x14 behaves differently than */
++/* generic 23 XX YY commands                                                */
++static int ipslr_cmd_23_06(ipslr_handle_t *p, char debug_on_off) {
++    CHECK(ipslr_write_args(p, 1, 3));
++    if(debug_on_off==0){
++        CHECK(ipslr_write_args_special(p, 4,0,0,0,0));
++    } else {
++        CHECK(ipslr_write_args_special(p, 4,1,1,0,0));
++    }
++    CHECK(command(p->fd, 0x23, 0x06, 0x14));
++    CHECK(get_status(p->fd));
++    return PSLR_OK;
++}
++
++/* Second exception. Command 0x23 0x04 0x08 behaves differently than generic */
++/* 23 XX YY commands                                                         */
++static int ipslr_cmd_23_04(ipslr_handle_t *p) {
++    CHECK(ipslr_write_args(p, 1, 3)); // posebni ARGS-i
++    CHECK(ipslr_write_args_special(p, 1, 1)); // posebni ARGS-i
++    CHECK(command(p->fd, 0x23, 0x04, 0x08));
++    CHECK(get_status(p->fd));
++    return PSLR_OK;
++}
++
++/* Function called to enable/disable debug mode. If debug_mode argument is 0 */
++/* function disables debug mode, else debug mode is enabled                  */
++int debug_onoff(ipslr_handle_t *p, char debug_mode){
++    uint8_t buf[16]; /* buffer for storing statuses and read_results */
++    
++    ipslr_cmd_00_09(p,1);
++
++    ipslr_cmd_23_XX(p,0x07,0x04,3);
++    read_result(p->fd,buf,0x10);
++
++    ipslr_cmd_23_XX(p,0x05,0x04,3);
++    read_result(p->fd,buf,0x04);
++    ipslr_status(p,buf);
++
++	if(debug_mode==0){
++    		ipslr_cmd_23_06(p,DEBUG_OFF);
++	} else {
++    		ipslr_cmd_23_06(p,DEBUG_ON);
++	}
++    ipslr_status(p,buf);
++
++
++    ipslr_cmd_23_04(p);
++
++    ipslr_cmd_23_XX(p,0x00,0x04, 0);
++
++    ipslr_cmd_00_09(p,2);
++    ipslr_status(p,buf);
++
++    return PSLR_OK;
++}
++
++/* ************* End enabling/disabling debug mode ************ */
++
+ user_file_format_t *get_file_format_t( user_file_format uff ) {
+     int i;    
+     for (i = 0; i<sizeof(file_formats) / sizeof(file_formats[0]); i++) {
+Index: pktriggercord-cli.c
+===================================================================
+--- pktriggercord-cli.c	(revision 270)
++++ pktriggercord-cli.c	(working copy)
+@@ -97,6 +97,7 @@
+     {"noshutter", no_argument, NULL, 21},
+     {"servermode", no_argument, NULL, 22},
+     {"servermode_timeout", required_argument, NULL, 23},
++    {"debug-mode", required_argument, NULL,24},
+     { NULL, 0, NULL, 0}
+ };
+ 
+@@ -200,6 +201,9 @@
+     bool servermode = false;
+     int servermode_timeout = 30;
+ 
++    int modify_debug_mode=0;
++    char debug_mode=0;
++
+     // just parse warning, debug flags
+     while  ((optc = getopt_long(argc, argv, shortopts, longopts, NULL)) != -1) {
+         switch (optc) {
+@@ -491,6 +495,9 @@
+                 servermode_timeout = atoi(optarg);
+                 break;
+ 
++	    case 24:
++		modify_debug_mode=1;
++		debug_mode=atoi(optarg);
+         }
+     }
+ 
+@@ -521,8 +528,16 @@
+     camera_name = pslr_camera_name(camhandle);
+     printf("%s: %s Connected...\n", argv[0], camera_name);
+ 
++/* if debug mode switch is on, there is a possibility someone just want to alter debug mode */
++    if( modify_debug_mode == 1) {
++	debug_onoff(camhandle,debug_mode);
++	camera_close(camhandle);
++	exit(0);
++    }
++
+     pslr_get_status(camhandle, &status);
+ 
++
+     if( color_space != -1 ) {
+ 	pslr_set_color_space( camhandle, color_space );
+     }
+@@ -860,6 +875,7 @@
+       --noshutter                       do not send shutter command, just wait for new photo, download and delete from camera\n\
+   -v, --version                         display version information and exit\n\
+   -h, --help                            display this help and exit\n\
++      --debug-mode={0|1}		enables or disables camera debug mode and exits (tested on K10D). Valid values are: 0, 1\n\
+ \n", name);
+ }
+ 
